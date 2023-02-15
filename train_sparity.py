@@ -49,6 +49,7 @@ from utils.loss import ComputeLoss
 from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
+from models.common import Bottleneck
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
@@ -209,7 +210,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
-
+    print(model)
     # Trainloader
     train_loader, dataset = create_dataloader(train_path, imgsz, batch_size // WORLD_SIZE, gs, single_cls,
                                               hyp=hyp, augment=True, cache=opt.cache, rect=opt.rect, rank=LOCAL_RANK,
@@ -316,25 +317,41 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            with amp.autocast(enabled=cuda):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
+            # with amp.autocast(enabled=cuda):
+            pred = model(imgs)  # forward
+            loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+            if RANK != -1:
+                loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+            if opt.quad:
+                loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+            # scaler.scale(loss).backward()
+            loss.backward()
+            # # ============================= sparsity training ========================== #
+            srtmp = opt.sr*(1 - 0.9*epoch/epochs)
+            if opt.st:
+                ignore_bn_list = []
+                for k, m in model.named_modules():
+                    if isinstance(m, Bottleneck):
+                        if m.add:
+                            ignore_bn_list.append(k.rsplit(".", 2)[0] + ".cv1.bn")
+                            ignore_bn_list.append(k + '.cv1.bn')
+                            ignore_bn_list.append(k + '.cv2.bn')
+                    if isinstance(m, nn.BatchNorm2d) and (k not in ignore_bn_list):
+                        m.weight.grad.data.add_(srtmp * torch.sign(m.weight.data))  # L1
+                        m.bias.grad.data.add_(opt.sr*10 * torch.sign(m.bias.data))  # L1
+            # # ============================= sparsity training ========================== #
 
             # Optimize
-            if ni - last_opt_step >= accumulate:
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
+            # if ni - last_opt_step >= accumulate:
+            optimizer.step()
+            # scaler.step(optimizer)  # optimizer.step
+            # scaler.update()
+            optimizer.zero_grad()
+            if ema:
+                ema.update(model)
+            # last_opt_step = ni
 
             # Log
             if RANK in [-1, 0]:
@@ -348,6 +365,34 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
+
+        # =============== show bn weights ===================== #
+        module_list = []
+        # module_bias_list = []
+        for i, layer in model.named_modules():
+            if isinstance(layer, nn.BatchNorm2d) and i not in ignore_bn_list:
+                bnw = layer.state_dict()['weight']
+                bnb = layer.state_dict()['bias']
+                module_list.append(bnw)
+                # module_bias_list.append(bnb)
+                # bnw = bnw.sort()
+                # print(f"{i} : {bnw} : ")
+        size_list = [idx.data.shape[0] for idx in module_list]
+
+        bn_weights = torch.zeros(sum(size_list))
+        bnb_weights = torch.zeros(sum(size_list))
+        index = 0
+        for idx, size in enumerate(size_list):
+            bn_weights[index:(index + size)] = module_list[idx].data.abs().clone()
+            # bnb_weights[index:(index + size)] = module_bias_list[idx].data.abs().clone()
+            index += size
+
+    #    print("bn_weights:", torch.sort(bn_weights))
+       # print("bn_bias:", torch.sort(bnb_weights))
+        # tb_writer.add_histogram('bn_weights/hist', bn_weights.numpy(), epoch, bins='doane')
+        # tb_writer.add_histogram('bn_bias/hist', bnb_weights.numpy(), epoch, bins='doane')
+
+
 
         if RANK in [-1, 0]:
             # mAP
@@ -370,8 +415,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
-            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+            log_vals = list(mloss) + list(results) + lr + [srtmp]
+            callbacks.run('on_fit_epoch_end', log_vals, bn_weights.numpy() ,epoch, best_fitness, fi)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
@@ -441,12 +486,14 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5n.pt', help='initial weights path')
+    parser.add_argument('--st', action='store_true',default=True, help='train with L1 sparsity normalization')
+    parser.add_argument('--sr', type=float, default=0.0001, help='L1 normal sparse rate')
+    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5l.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/voc.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=64, help='total batch size for all GPUs, -1 for autobatch')
+    parser.add_argument('--batch-size', type=int, default=8, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=512, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')

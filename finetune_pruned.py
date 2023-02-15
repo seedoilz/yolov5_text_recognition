@@ -14,7 +14,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-
+from models.yolo import ModelPruned
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -24,6 +24,7 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, AdamW, lr_scheduler
 from tqdm import tqdm
+from models.common import Bottleneck
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -114,14 +115,17 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = ckpt["model"]
+        maskbndict = ckpt['model'].maskbndict
+        model = ModelPruned(maskbndict, ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        LOGGER.info('No pruned weights loaded, please set the right pruned weight path ...')  # report
+        return
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -178,27 +182,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
-    if pretrained:
-        # Optimizer
-        if ckpt['optimizer'] is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
-            best_fitness = ckpt['best_fitness']
-
-        # EMA
-        if ema and ckpt.get('ema'):
-            ema.ema.load_state_dict(ckpt['ema'].float().state_dict())
-            ema.updates = ckpt['updates']
-
-        # Epochs
-        start_epoch = ckpt['epoch'] + 1
-        if resume:
-            assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
-        if epochs < start_epoch:
-            LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
-            epochs += ckpt['epoch']  # finetune additional epochs
-
-        del ckpt, csd
-
+    
     # DP mode
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         LOGGER.warning('WARNING: DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
@@ -274,6 +258,15 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
+        ignore_bn_list = []
+        for k, m in model.named_modules():
+            if isinstance(m, Bottleneck):
+                if m.add:
+                    ignore_bn_list.append(k.rsplit(".", 2)[0] + ".cv1.bn")
+                    ignore_bn_list.append(k + '.cv1.bn')
+                    ignore_bn_list.append(k + '.cv2.bn')
+
+
         # Update image weights (optional, single-GPU only)
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
@@ -326,7 +319,6 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
             # Backward
             scaler.scale(loss).backward()
-
             # Optimize
             if ni - last_opt_step >= accumulate:
                 scaler.step(optimizer)  # optimizer.step
@@ -349,6 +341,29 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
         scheduler.step()
 
+
+        # =============== show bn weights ===================== #
+        module_list = []
+        # module_bias_list = []
+        for i, layer in model.named_modules():
+            if isinstance(layer, nn.BatchNorm2d) and i not in ignore_bn_list:
+                bnw = layer.state_dict()['weight']
+                bnb = layer.state_dict()['bias']
+                module_list.append(bnw)
+                # module_bias_list.append(bnb)
+                # bnw = bnw.sort()
+                # print(f"{i} : {bnw} : ")
+        size_list = [idx.data.shape[0] for idx in module_list]
+
+        bn_weights = torch.zeros(sum(size_list))
+        bnb_weights = torch.zeros(sum(size_list))
+        index = 0
+        for idx, size in enumerate(size_list):
+            bn_weights[index:(index + size)] = module_list[idx].data.abs().clone()
+            # bnb_weights[index:(index + size)] = module_bias_list[idx].data.abs().clone()
+            index += size
+
+
         if RANK in [-1, 0]:
             # mAP
             callbacks.run('on_train_epoch_end', epoch=epoch)
@@ -370,8 +385,8 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             if fi > best_fitness:
                 best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
-            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+            log_vals = list(mloss) + list(results) + lr + [0]
+            callbacks.run('on_fit_epoch_end', log_vals, bn_weights.numpy(), epoch, best_fitness, fi)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
@@ -441,12 +456,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default=ROOT / 'yolov5n.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default=ROOT / 'pruned_model.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/voc.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=64, help='total batch size for all GPUs, -1 for autobatch')
+    parser.add_argument('--batch-size', type=int, default=32, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=512, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
